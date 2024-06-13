@@ -7,85 +7,240 @@ import pyqtgraph.opengl as gl
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import serial.tools.list_ports
 import threading
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
-class Max3D:
-    def __init__(self, buffer_size=1, max_axis=0):
+class SpectrumDataStorage:
+    def __init__(self, buffer_size=1):
         self.buffer_size = buffer_size
-        self.max_axis = max_axis
-        self.max_buffer = None
+        self._max_window_size = 5
+        self._smooth_window_size = 4
         
-    def append(self, data_array):
-        max = np.max(data_array, axis=self.max_axis)  
+        self._x = np.arange(2399.0, 2485.5, 0.5)
+        self._y = np.empty(0, dtype=int)
+        self._z = np.empty((0, len(self._x)), dtype=float)
+        self._z_max = np.empty((0, len(self._x)), dtype=float)
+        self._z_smooth = np.empty((0, len(self._x[self._smooth_window_size -1:])), dtype=float)
 
-        if self.max_buffer is None:
-            self.max_buffer = max
-            self.max_buffer = np.expand_dims(self.max_buffer, axis=0)
-        else:
-            self.max_buffer = np.append(self.max_buffer, [max], axis=0) 
-        if self.max_buffer.shape[0] > self.buffer_size:
-            self.max_buffer = self.max_buffer[-self.buffer_size:]
+        self.lock = threading.Lock()
 
-    def get3D(self):
-        X, Y = np.meshgrid(np.arange(self.max_buffer.shape[1]), np.arange(self.max_buffer.shape[0]))
+    @property
+    def x(self):
+        with self.lock:
+            return self._x.copy()
         
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
+    @property
+    def y(self):
+        with self.lock:
+            return self._y.copy()
         
-        ax.plot_surface(X, Y, self.max_buffer/10, cmap='viridis')
+    @property
+    def z(self):
+        with self.lock:
+            return self._z.copy()
 
-        ax.set_ylabel('Series')
-        ax.set_xlabel('Frequency (MHz)')
-        ax.set_zlabel('Signal Level (dB)')
-        plt.show()
-
-class Histogram3D:
-    def __init__(self, buffer_size=1, bins=10, data_range=None):
-        self.buffer_size = buffer_size
-        self.bins = bins
-        self.data_range = data_range
-        self.histograms = None
-        self.histogram_buffer = None
-
-    def append(self, data_array):
-        if self.histogram_buffer is None:
-            if isinstance(self.bins, int):
-                zsize = self.bins
-            else:
-                zsize = len(self.bins)-1
-            self.histogram_buffer = np.zeros((0, data_array.shape[1], zsize))
-
-        self.histograms = self.calculate_histograms(data_array)
-
-        self.histogram_buffer = np.append(self.histogram_buffer, [self.histograms], axis=0)
-        if self.histogram_buffer.shape[0] > self.buffer_size:
-            self.histogram_buffer = self.histogram_buffer[-self.buffer_size:]
-
-    def calculate_histograms(self, data):
-        histograms = []
-        for col in range(data.shape[1]):
-            hist, _ = np.histogram(data[:, col],bins=self.bins, range=self.data_range)
-            histograms.append(hist)
-        return np.array(histograms)
+    @property
+    def shape(self):
+        with self.lock:
+            return len(self._x), self._y.shape[0], self._z.shape[0], self._z.shape[1]
     
-    def get_histograms(self):
-        if self.histograms is None:
-            raise ValueError("Histograms have not been calculated yet.")
-        return np.fliplr(np.rot90(self.histograms, axes=(1,0)))
+    @property
+    def max_window_size(self):
+        with self.lock:
+            return self._max_window_size
+    
+    @max_window_size.setter
+    def max_window_size(self, value, recompute=False):
+        if value < 1:
+            raise ValueError("max window_size must be at least 1")
+        with self.lock:
+            self._max_window_size = value
+            if recompute:
+                self.__recompute_z_max()       
+
+    @property
+    def smooth_window_size(self):
+        with self.lock:
+            return self._smooth_window_size
+    
+    @smooth_window_size.setter
+    def maxsmooth_window_sizewindow_size(self, value, recompute=False):
+        if value < 1:
+            raise ValueError("smooth window_size must be at least 1")
+        with self.lock:
+            self._smooth_window_size = value
+            if recompute:
+                self.__recompute_z_smooth()       
+
+    def __moving_average(self, data):
+        return np.convolve(data, np.ones(self._smooth_window_size) / self._smooth_window_size, mode = 'valid')
+    
+    def __recompute_z_max(self):
+        self._z_max = np.empty((0, len(self._x)), dtype=float)
+        for i in range(len(self._z)):
+            if i < self._max_window_size:
+                max_z = np.max(self._z[:i + 1], axis=0)
+            else:
+                max_z = np.max(self._z[i - self._max_window_size + 1:i + 1], axis=0)
+            self._z_max = np.append(self._z_max, [max_z], axis=0)
+
+    def __recompute_z_smooth(self):
+        self._z_smooth = np.empty((0, len(self._x[self._smooth_window_size -1:])), dtype=float)
+        for i in range(len(self._z)):
+            self._z_smooth = np.append(self._z_smooth, [self.__moving_average(self._z[i])], axis=0)
+
+    def append(self, y, z):
+        if len(z) != len(self._x):
+            raise ValueError("Length of z must be equal to length of x")
+        
+        with self.lock:
+            if len(self._y) < self.buffer_size:
+                self._y = np.append(self._y, y)
+                self._z = np.append(self._z, [z], axis=0)
+                self._z_smooth = np.append(self._z_smooth, [self.__moving_average(z)], axis=0)
+            else:
+                self._y = np.roll(self._y, -1)
+                self._z = np.roll(self._z, -1, axis=0)
+                self._z_smooth = np.roll(self._z_smooth, -1, axis=0)
+                self._y[-1] = y
+                self._z[-1] = z
+                self._z_smooth[-1] = self.__moving_average(z)
+
+            # Compute z_max
+            if len(self._z) <= self._max_window_size:
+                max_z = np.max(self._z, axis=0)
+            else:
+                max_z = np.max(self._z[-self._max_window_size:], axis=0)
+
+            if len(self._z_max) < self.buffer_size:
+                self._z_max = np.append(self._z_max, [max_z], axis=0)
+            else:
+                self._z_max = np.roll(self._z_max, -1, axis=0)
+                self._z_max[-1] = max_z
+
+    def get(self):
+        with self.lock:
+            return self._z[-1]
+        
+    def get_smooth(self):
+        with self.lock:
+            return self._x[self._smooth_window_size -1:], self._z_smooth[-1]
+        
+    def get_max(self, number=None):
+        with self.lock:
+            if number is None:
+                return np.max(self._z, axis=0)
+
+            if number > self.buffer_size:
+                raise ValueError("number cannot be greater than buffer_size")
+            
+            return np.max(self._z[-number:], axis=0)
+
+    def get_mean(self, number=None):
+        with self.lock:
+            if number is None:
+                return np.mean(self._z, axis=0)
+
+            if number > self.buffer_size:
+                raise ValueError("number cannot be greater than buffer_size")
+            
+            return np.mean(self._z[-number:], axis=0)
+
+
+    def get_data(self, nb_value=None, pad_value=0):
+        with self.lock:
+            if nb_value is None:
+                return self._z
+            
+            if nb_value > self.buffer_size:
+                raise ValueError("nb_value cannot be greater than buffer_size")
+            
+            data = self._z if nb_value is None else self._z[-nb_value:]
+            if nb_value > data.shape[0]:
+                padding = ((nb_value - data.shape[0], 0), (0, 0))
+                data = np.pad(data, padding, mode='constant', constant_values=pad_value)
+            return data
+
+    def histogram(self, nb_value=None, bins=10, data_range=None):
+        with self.lock:
+            hist = []
+            bin_edges = None
+            
+            data = self._z if nb_value is None else self._z[-nb_value:]
+            for i in range(data.shape[1]):
+                h, edges = np.histogram(data[:, i], bins=bins, range=data_range)
+                hist.append(h)
+                if bin_edges is None:
+                    bin_edges = edges
+        return np.fliplr(np.rot90(np.array(hist), axes=(1,0))), bin_edges
+
+    def __get_maxdata(self, nb_value=None, pad_value=0):
+        if nb_value is None:
+            return self._z_max
+        
+        if nb_value > self.buffer_size:
+            raise ValueError("nb_value cannot be greater than buffer_size")
+        
+        maxdata = self.self.z_max if nb_value is None else self.self.z_max[-nb_value:]
+        if nb_value > maxdata.shape[0]:
+            padding = ((nb_value - maxdata.shape[0], 0), (0, 0))
+            maxdata = np.pad(maxdata, padding, mode='constant', constant_values=pad_value)
+        return maxdata
+
+    def get_3D(self, nb_value=None, pad_value=0):
+        z_data = self.get_data(nb_value, pad_value)
+        if nb_value is None:
+            nb_value = z_data.shape[0]
+
+        if nb_value > self.buffer_size:
+            raise ValueError("nb_value cannot be greater than buffer_size")
+        
+        if nb_value > y_data.shape[0]:
+            padding_size = nb_value - y_data.shape[0]
+            if y_data.shape[0] > 1:
+                interval = np.median(np.diff(y_data))  # Calculate median interval
+            else:
+                interval = 1  # Default interval if not enough data points
+
+            pad_start = y_data[0] - interval * padding_size
+            padding = np.arange(pad_start, y_data[0], interval, dtype=int)
+            y_data = np.pad(y_data, (padding_size, 0), mode='constant', constant_values=pad_value)
+            y_data[:padding_size] = padding
+
+        return self._x, y_data, z_data
+        
+    def get_max3D(self, nb_value=None, pad_value=0):
+        z_max = self.__get_maxdata(nb_value, pad_value)
+        if nb_value is None:
+            nb_value = z_max.shape[0]
+
+        if nb_value > self.buffer_size:
+            raise ValueError("nb_value cannot be greater than buffer_size")
+        
+        if nb_value > y_data.shape[0]:
+            padding_size = nb_value - y_data.shape[0]
+            if y_data.shape[0] > 1:
+                interval = np.median(np.diff(y_data))  # Calculate median interval
+            else:
+                interval = 1  # Default interval if not enough data points
+
+            pad_start = y_data[0] - interval * padding_size
+            padding = np.arange(pad_start, y_data[0], interval, dtype=int)
+            y_data = np.pad(y_data, (padding_size, 0), mode='constant', constant_values=pad_value)
+            y_data[:padding_size] = padding
+
+        return self._x, y_data, z_max     
+
 
 class SpectrumAnalyzer(QtWidgets.QMainWindow):
     def __init__(self, *args, **kwargs):
         super(SpectrumAnalyzer, self).__init__(*args, **kwargs)
-        self.x_range = np.arange(2399.0, 2485.5, 0.5)
         self.timerange = 900
+        self.values = 90
+        self.raw = True
         self.min_limit = -92
-        self.full = np.full((1, len(self.x_range)), fill_value=-110, dtype=np.int8)
         self.lock = threading.Lock()
         self.worker = Worker(self)
-        
-        self.hist3d = Histogram3D(buffer_size=900, bins=np.arange(self.min_limit, 1))
-        self.max3d = Max3D(buffer_size=100)
+
+        self.spectrum = SpectrumDataStorage(self.timerange)        
 
         self.initUI()
         self.initWorker()
@@ -99,17 +254,20 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.layout = QtWidgets.QVBoxLayout(self.central_widget)
         self.win = pg.GraphicsLayoutWidget()
         self.layout.addWidget(self.win)
+        self.bottom_widget = QtWidgets.QWidget()
+        self.bottom_layout = QtWidgets.QGridLayout(self.bottom_widget)
+        self.layout.addWidget(self.bottom_widget)
 
         pg.setConfigOption('imageAxisOrder', 'row-major')
         pg.setConfigOptions(antialias=True)
         
-        hmajor_ticks = [(i, f"{self.x_range[i]:.1f}") for i in range(2, 173, 10)]
+        hmajor_ticks = [(i, f"{self.spectrum._x[i]:.1f}") for i in range(2, 173, 10)]
         hminor_ticks = [(i, '') for i in range(0, 173)]
 
 
         self.plotHM = self.win.addPlot(title='Heatmap')
         cmHM = pg.colormap.get('YlGnBu_r', source='matplotlib')
-        self.img_hm = pg.ImageItem(image=self.full, levels=(-110, 0), lut=cmHM.getLookupTable(), enableAutoLevels=False)
+        self.img_hm = pg.ImageItem(image=self.spectrum._z, levels=(-110, 0), lut=cmHM.getLookupTable(), enableAutoLevels=False)
         self.plotHM.addItem(self.img_hm)
         haxis = self.plotHM.getAxis('bottom')
         haxis.setTicks([hmajor_ticks, hminor_ticks])
@@ -119,7 +277,7 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.plotHits = self.win.addPlot(title='Hits')
 
         cmHits = pg.colormap.get('YlGnBu_r', source='matplotlib')
-        self.img_hits = pg.ImageItem(image=np.zeros((abs(self.min_limit), len(self.x_range)), dtype=np.int64), levels=(0, 90), lut=cmHits.getLookupTable(), enableAutoLevels=True, autoDownSample=True)
+        self.img_hits = pg.ImageItem(image=np.zeros((abs(self.min_limit), self.spectrum.shape[0]), dtype=np.int64), levels=(0, 90), lut=cmHits.getLookupTable(), enableAutoLevels=True, autoDownSample=True)
         self.plotHits.addItem(self.img_hits)
         haxis = self.plotHits.getAxis('bottom')
         haxis.setTicks([hmajor_ticks, hminor_ticks])
@@ -144,6 +302,19 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.freqTxt.setParentItem(self.vLine)
         self.vbLvl = self.plotLvl.vb
         self.plotLvl.scene().sigMouseMoved.connect(self.mouseMoved)
+
+        self.rawRadio = QtWidgets.QRadioButton('raw')
+        self.smoothRadio = QtWidgets.QRadioButton('smooth')
+        self.rawRadio.setChecked(True)
+        self.rawRadio.toggled.connect(self.setPlotMode)
+        self.bottom_layout.addWidget(self.rawRadio, 0, 1)
+        self.bottom_layout.addWidget(self.smoothRadio, 0, 2)
+
+        lblspin = QtWidgets.QLabel('Values')
+        spin = pg.SpinBox(value=self.values, int=True, dec=True, bounds=[1, None], minStep=1, step=1, decimals=4)
+        spin.sigValueChanged.connect(self.setValues)
+        self.bottom_layout.addWidget(lblspin, 0, 3)
+        self.bottom_layout.addWidget(spin, 0, 4)
 
         self.toggle_button = QtWidgets.QPushButton("Test")
         self.toggle_button.clicked.connect(self.toggleButton)
@@ -171,50 +342,43 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
             self.freqTxt.setAnchor((0.0, -3.0))
             self.vLine.setPos(index)
 
+    def setPlotMode(self):
+        self.raw = self.rawRadio.isChecked()
+
+    def setValues(self, sb):
+        self.values = sb.value()
+
+    def setSmoothWindow(self,sb):
+        with pg.BusyCursor():
+            pass
+
     def toggleButton(self):
-        self.max3d.get3D()
-
-
-    def get_last_elements(self, arr, number, pad_value=-110):
-        padded_arr = np.pad(arr, ((max(0, number - arr.shape[0]), 0), (0, 0)), mode='constant', constant_values=pad_value)
-        return padded_arr[-number:]
+        self.wgl.show()
+        pass
 
     def normalize_array(self, arr, min_val, max_val):
         return np.clip((arr - min_val) / (max_val - min_val), 0.2, 1.)
 
-    def moving_average(self, data, window_size):
-        return np.convolve(data, np.ones(window_size) / window_size, mode = 'valid')
-    
     @QtCore.pyqtSlot()
     def update(self):
-        bins = np.arange(self.min_limit, 1)
-        hits = np.zeros((abs(self.min_limit), len(self.x_range)), dtype=np.int64)
 
-        with self.lock:
-            z = self.full.copy()
+        x= self.spectrum.x
 
-        z_last90 = self.get_last_elements(z, 90)
-        self.hist3d.append(z_last90)
-        self.max3d.append(z_last90)
+        hits, _ = self.spectrum.histogram(nb_value=self.values, bins=np.arange(self.min_limit, 1))
 
-        max = np.max(z_last90, axis=0)
-        avg = np.mean(z_last90, axis=0)
+        if self.raw:
+            self.c_values.setData(x=x, y=self.spectrum.get())
+        else:
+            smooth_x, smooth = self.spectrum.get_smooth()
+            self.c_values.setData(x=smooth_x, y=smooth)
 
-        window_size=5
-        smooth = self.moving_average(z[-1], window_size)
-        smooth_x = self.x_range[window_size -1:]
-
-        hits = self.hist3d.get_histograms()
-
-        self.c_values.setData(x=self.x_range, y=z[-1])
-        self.c_avg.setData(x=self.x_range, y=avg)
-        self.c_max.setData(x=self.x_range, y=max)
-        # self.c_smooth.setData(x=smooth_x, y=smooth)
-        self.img_hm.setImage(z_last90, autoLevels=False)
+        self.c_avg.setData(x=x, y=self.spectrum.get_mean(self.values))
+        self.c_max.setData(x=x, y=self.spectrum.get_max(self.values))
+        self.img_hm.setImage(self.spectrum.get_data(self.values, -110), autoLevels=False)
         self.img_hits.setImage(hits, autoLevels=True, autoDownsample=True)
+
+        self.sp.setData(z=self.spectrum.z)
       
-
-
 class Worker(QtCore.QObject):
     data_acquired = QtCore.pyqtSignal()
 
@@ -245,13 +409,11 @@ class Worker(QtCore.QObject):
                         values = n.split()
                         values_int = np.array([int(v.decode('utf-8')) for v in values])
                         for freq in (2400.0, 2412.0, 2424.0, 2436.0, 2448.0, 2460.0, 2484.0):
-                            i = np.where(self.parent.x_range == freq)[0][0]
+                            i = np.where(self.parent.spectrum.x == freq)[0][0]
                             values_int[i] = -98 if values_int[i] <= -90 else values_int[i]
-                        with self.lock:
-                            self.parent.full = np.append(self.parent.full[-self.parent.timerange + 1:], [values_int], axis=0)
-                            # if self.parent.full.shape[0] > self.parent.timerange:
-                            #     self.parent.full = self.parent.full[-self.parent.timerange:]
-                            self.data_acquired.emit()
+                        timestamp = time.time_ns()
+                        self.parent.spectrum.append(timestamp, values_int)
+                        self.data_acquired.emit()
 
     def findport(self, desc):
         port = next((port.name for port in serial.tools.list_ports.comports() if desc.lower() in port.description.lower()), None)
