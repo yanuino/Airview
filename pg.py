@@ -376,8 +376,6 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.c_max.setData(x=x, y=self.spectrum.get_max(self.values))
         self.img_hm.setImage(self.spectrum.get_data(self.values, -110), autoLevels=False)
         self.img_hits.setImage(hits, autoLevels=True, autoDownsample=True)
-
-        self.sp.setData(z=self.spectrum.z)
       
 class Worker(QtCore.QObject):
     data_acquired = QtCore.pyqtSignal()
