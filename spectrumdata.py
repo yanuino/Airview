@@ -2,6 +2,11 @@ import numpy as np
 from numba import jit
 import threading
 
+@jit(nopython=True)
+def moving_average(data, window_size):
+    window = np.ones(window_size) / window_size
+    return np.convolve(data, window, mode='valid')
+
 class SpectrumDataStorage:
     def __init__(self, buffer_size=1):
         self.buffer_size = buffer_size
@@ -64,10 +69,8 @@ class SpectrumDataStorage:
             if recompute:
                 self.__recompute_z_smooth()       
 
-    #@jit(nopython=True)
     def __moving_average(self, data):
-        window = np.ones(self._smooth_window_size) / self._smooth_window_size
-        return np.convolve(data, window, mode = 'valid')
+        return moving_average(data, self._smooth_window_size)
     
     def __recompute_z_max(self):
         z_max_list = []
