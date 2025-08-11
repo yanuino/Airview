@@ -17,7 +17,6 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.values = 90
         self.raw = True
         self.min_limit = -92
-        self.lock = threading.Lock()
         self.worker = Worker(self)
 
         self.spectrum = SpectrumDataStorage(self.timerange)        
@@ -41,13 +40,18 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         pg.setConfigOption('imageAxisOrder', 'row-major')
         pg.setConfigOptions(antialias=True)
         
-        hmajor_ticks = [(i, f"{self.spectrum._x[i]:.1f}") for i in range(2, 173, 10)]
-        hminor_ticks = [(i, '') for i in range(0, 173)]
+        # Use frequency values for ticks
+        x = self.spectrum.x
+        hmajor_ticks = [(freq, f"{freq:.0f}") for freq in x if freq % 10 == 0]
+        hminor_ticks = [(freq, '') for freq in x]
+
 
 
         self.plotHM = self.win.addPlot(title='Heatmap')
         cmHM = pg.colormap.get('YlGnBu_r', source='matplotlib')
         self.img_hm = pg.ImageItem(image=self.spectrum._z, levels=(-110, 0), lut=cmHM.getLookupTable(), enableAutoLevels=False)
+        # Set the image rectangle to match frequency axis
+        self.img_hm.setRect(QtCore.QRectF(x[0], 0, x[-1] - x[0], self.spectrum._z.shape[0]))
         self.plotHM.addItem(self.img_hm)
         haxis = self.plotHM.getAxis('bottom')
         haxis.setTicks([hmajor_ticks, hminor_ticks])
@@ -58,6 +62,8 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
 
         cmHits = pg.colormap.get('YlGnBu_r', source='matplotlib')
         self.img_hits = pg.ImageItem(image=np.zeros((abs(self.min_limit), self.spectrum.shape[0]), dtype=np.int64), levels=(0, 90), lut=cmHits.getLookupTable(), enableAutoLevels=True, autoDownSample=True)
+        # Set the image rectangle for Hits as well
+        self.img_hits.setRect(QtCore.QRectF(x[0], 0, x[-1] - x[0], abs(self.min_limit)))
         self.plotHits.addItem(self.img_hits)
         haxis = self.plotHits.getAxis('bottom')
         haxis.setTicks([hmajor_ticks, hminor_ticks])
@@ -101,10 +107,10 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.layout.addWidget(self.toggle_button)
 
     def initWorker(self):
-        self.worker_thread = QtCore.QThread()
+        self.worker_thread = QtCore.QThread(self)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.acquire)
-        self.worker.data_acquired.connect(self.update)
+        self.worker.data_acquired.connect(self.update, QtCore.Qt.QueuedConnection)
         self.worker_thread.start()
 
     def closeEvent(self, event):
@@ -141,29 +147,24 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def update(self):
-
-        x= self.spectrum.x
-
+        x = self.spectrum.x
         hits, _ = self.spectrum.histogram(nb_value=self.values, bins=np.arange(self.min_limit, 1))
-
         if self.raw:
             self.c_values.setData(x=x, y=self.spectrum.get())
         else:
             smooth_x, smooth = self.spectrum.get_smooth()
             self.c_values.setData(x=smooth_x, y=smooth)
-
         self.c_avg.setData(x=x, y=self.spectrum.get_mean(self.values))
         self.c_max.setData(x=x, y=self.spectrum.get_max(self.values))
         self.img_hm.setImage(self.spectrum.get_data(self.values, -110), autoLevels=False)
-        self.img_hits.setImage(hits, autoLevels=True, autoDownsample=True)
-      
+        self.img_hits.setImage(hits, autoLevels=True, autoDownSample=True)
+
 class Worker(QtCore.QObject):
     data_acquired = QtCore.pyqtSignal()
 
     def __init__(self, parent):
         super().__init__()
         self.parent = parent
-        self.lock = threading.Lock()
         self.stop_thread = False
 
     def acquire(self):
@@ -186,9 +187,9 @@ class Worker(QtCore.QObject):
                     for n in m:
                         values = n.split()
                         values_int = np.array([int(v.decode('utf-8')) for v in values])
-                        for freq in (2400.0, 2412.0, 2424.0, 2436.0, 2448.0, 2460.0, 2484.0):
-                            i = np.where(self.parent.spectrum.x == freq)[0][0]
-                            values_int[i] = -98 if values_int[i] <= -90 else values_int[i]
+                        # for freq in (2400.0, 2412.0, 2424.0, 2436.0, 2448.0, 2460.0, 2484.0):
+                        #     i = np.where(self.parent.spectrum.x == freq)[0][0]
+                        #     values_int[i] = -98 if values_int[i] <= -90 else values_int[i]
                         timestamp = time.time_ns()
                         self.parent.spectrum.append(timestamp, values_int)
                         self.data_acquired.emit()
