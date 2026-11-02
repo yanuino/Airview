@@ -4,14 +4,14 @@ import numpy as np
 from numba import jit
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def moving_average(data, window_size):
     """Return a valid convolution of data with a uniform moving-average window."""
     window = np.ones(window_size) / window_size
     return np.convolve(data, window, mode="valid")
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def rowwise_max(arr):
     """Return the maximum of each column in a two-dimensional array."""
     n = arr.shape[1]
@@ -21,7 +21,7 @@ def rowwise_max(arr):
     return out
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def rowwise_mean(arr):
     """Return the mean of each column in a two-dimensional array."""
     n = arr.shape[1]
@@ -37,15 +37,13 @@ class SpectrumDataStorage:
     def __init__(self, buffer_size=1):
         """Initialize storage for up to buffer_size spectrum samples."""
         self.buffer_size = buffer_size
-        self._max_window_size = 5
         self._smooth_window_size = 4
 
         self._x = np.arange(2399.0, 2485.5, 0.5)
         self._y = np.zeros(buffer_size, dtype=int)
         self._z = np.full((buffer_size, len(self._x)), -120, dtype=float)
-        self._z_max = np.zeros((buffer_size, len(self._x)), dtype=float)
         self._z_smooth = np.zeros(
-            (buffer_size, len(self._x[self._smooth_window_size - 1 :])), dtype=float
+            (buffer_size, len(self._x) - self._smooth_window_size + 1), dtype=float
         )
 
         self._current_size = 0
@@ -82,57 +80,52 @@ class SpectrumDataStorage:
             )
 
     @property
-    def max_window_size(self):
-        """Return the number of recent samples used for rolling maxima."""
-        with self.lock:
-            return self._max_window_size
-
-    @max_window_size.setter
-    def max_window_size(self, value, recompute=False):
-        if value < 1:
-            raise ValueError("max window_size must be at least 1")
-        with self.lock:
-            self._max_window_size = value
-        if recompute:
-            self.__recompute_z_max()
-
-    @property
     def smooth_window_size(self):
         """Return the moving-average window size."""
         with self.lock:
             return self._smooth_window_size
 
-    @smooth_window_size.setter
-    def smooth_window_size(self, value, recompute=False):
-        if value < 1:
-            raise ValueError("smooth window_size must be at least 1")
+    def set_smooth_window_size(self, value, recompute=False):
+        """Change the moving-average window size.
+
+        Args:
+            value: New window size, at least 1.
+            recompute: Whether to recompute the smoothed data of stored samples.
+                Without it, stored smoothed samples are cleared.
+
+        Raises:
+            ValueError: If value is lower than 1 or larger than the number of
+                frequency coordinates.
+        """
+        if value < 1 or value > len(self._x):
+            raise ValueError("smooth window_size must be between 1 and len(x)")
         with self.lock:
             self._smooth_window_size = value
-        if recompute:
-            self.__recompute_z_smooth()
+            self._z_smooth = np.zeros(
+                (self.buffer_size, len(self._x) - value + 1), dtype=float
+            )
+            if recompute and self._current_size:
+                for i in range(self._current_size):
+                    self._z_smooth[i] = moving_average(self._z[i], value)
 
-    def __moving_average(self, data):
-        return moving_average(data, self._smooth_window_size)
+    def _last_rows(self, array, count):
+        """Return the last count stored rows of array, oldest first.
 
-    def __recompute_z_max(self):
-        with self.lock:
-            z_max_list = []
-            for i in range(self._current_size):
-                if i < self._max_window_size:
-                    max_z = np.max(self._z[: i + 1], axis=0)
-                else:
-                    max_z = np.max(
-                        self._z[i - self._max_window_size + 1 : i + 1], axis=0
-                    )
-                z_max_list.append(max_z)
-            self._z_max[: self._current_size] = np.vstack(z_max_list)
+        The result may be a view of the buffer: use it while holding the lock.
+        """
+        count = min(count, self._current_size)
+        end = self._next_idx
+        if count <= end:
+            return array[end - count : end]
+        return np.concatenate((array[end - count :], array[:end]))
 
-    def __recompute_z_smooth(self):
-        with self.lock:
-            smoothed_data = []
-            for i in range(self._current_size):
-                smoothed_data.append(self.__moving_average(self._z[i]))
-            self._z_smooth[: self._current_size] = np.vstack(smoothed_data)
+    def _count(self, number, name):
+        """Validate a requested row count and default it to the stored size."""
+        if number is None:
+            return self._current_size
+        if number > self.buffer_size:
+            raise ValueError(f"{name} cannot be greater than buffer_size")
+        return number
 
     def append(self, y, z):
         """Add a timestamp and spectrum sample to the circular buffer.
@@ -151,35 +144,18 @@ class SpectrumDataStorage:
             idx = self._next_idx
             self._y[idx] = y
             self._z[idx] = z
-            self._z_smooth[idx] = self.__moving_average(z)
-
-            # Compute z_max for this entry
-            if self._current_size < self._max_window_size:
-                max_z = np.max(self._z[: self._current_size + 1], axis=0)
-            else:
-                start_idx = (idx - self._max_window_size + 1) % self.buffer_size
-                if self._current_size < self.buffer_size:
-                    max_z = np.max(self._z[: self._current_size + 1], axis=0)
-                else:
-                    if start_idx <= idx:
-                        max_z = np.max(self._z[start_idx : idx + 1], axis=0)
-                    else:
-                        max_z = np.max(
-                            np.vstack((self._z[start_idx:], self._z[: idx + 1])), axis=0
-                        )
-            self._z_max[idx] = max_z
+            self._z_smooth[idx] = moving_average(self._z[idx], self._smooth_window_size)
 
             if self._current_size < self.buffer_size:
                 self._current_size += 1
-            self._next_idx = (self._next_idx + 1) % self.buffer_size
+            self._next_idx = (idx + 1) % self.buffer_size
 
     def get(self):
         """Return the newest raw spectrum sample, or None if the buffer is empty."""
         with self.lock:
             if self._current_size == 0:
                 return None
-            idx = (self._next_idx - 1) % self.buffer_size
-            return self._z[idx]
+            return self._z[self._next_idx - 1].copy()
 
     def get_smooth(self):
         """Return smoothed frequency coordinates and the newest smoothed sample.
@@ -187,10 +163,10 @@ class SpectrumDataStorage:
         If the buffer is empty, the smoothed sample is None.
         """
         with self.lock:
+            x = self._x[self._smooth_window_size - 1 :]
             if self._current_size == 0:
-                return self._x[self._smooth_window_size - 1 :], None
-            idx = (self._next_idx - 1) % self.buffer_size
-            return self._x[self._smooth_window_size - 1 :], self._z_smooth[idx]
+                return x, None
+            return x, self._z_smooth[self._next_idx - 1].copy()
 
     def get_max(self, number=None):
         """Return per-frequency maxima across the most recent samples.
@@ -208,13 +184,8 @@ class SpectrumDataStorage:
         with self.lock:
             if self._current_size == 0:
                 return None
-            if number is None:
-                number = self._current_size
-            if number > self.buffer_size:
-                raise ValueError("number cannot be greater than buffer_size")
-            idxs = [(self._next_idx - i - 1) % self.buffer_size for i in range(number)]
-            data = self._z[idxs]
-        return rowwise_max(data)
+            number = self._count(number, "number")
+            return rowwise_max(self._last_rows(self._z, number))
 
     def get_mean(self, number=None):
         """Return per-frequency means across the most recent samples.
@@ -232,13 +203,8 @@ class SpectrumDataStorage:
         with self.lock:
             if self._current_size == 0:
                 return None
-            if number is None:
-                number = self._current_size
-            if number > self.buffer_size:
-                raise ValueError("number cannot be greater than buffer_size")
-            idxs = [(self._next_idx - i - 1) % self.buffer_size for i in range(number)]
-            data = self._z[idxs]
-        return rowwise_mean(data)
+            number = self._count(number, "number")
+            return rowwise_mean(self._last_rows(self._z, number))
 
     def get_data(self, nb_value=None, pad_value=0):
         """Return raw samples in chronological order, optionally padding rows.
@@ -253,73 +219,66 @@ class SpectrumDataStorage:
         with self.lock:
             if self._current_size == 0:
                 return np.zeros((nb_value if nb_value else 0, len(self._x)))
-            if nb_value is None:
-                nb_value = self._current_size
-            if nb_value > self.buffer_size:
-                raise ValueError("nb_value cannot be greater than buffer_size")
-            idxs = [
-                (self._next_idx - i - 1) % self.buffer_size for i in range(nb_value)
-            ]
-            data = self._z[idxs][::-1]
+            nb_value = self._count(nb_value, "nb_value")
+            data = self._last_rows(self._z, nb_value).copy()
         if nb_value > data.shape[0]:
             padding = ((nb_value - data.shape[0], 0), (0, 0))
             data = np.pad(data, padding, mode="constant", constant_values=pad_value)
         return data
 
-    def histogram(self, nb_value=None, bins=10, data_range=None):
-        """Calculate a histogram for each frequency across stored samples.
+    def histogram(self, nb_value=None, bins=10, data_range=None, clip=False):
+        """Count, for each frequency, how many samples fall in each value bin.
 
         Args:
             nb_value: Number of recent samples to include, or None for all stored
                 samples.
-            bins: Histogram bin count or bin edges, as accepted by numpy.histogram.
-            data_range: Optional histogram range passed to numpy.histogram.
+            bins: Bin count or bin edges, as accepted by numpy.histogram_bin_edges.
+            data_range: Optional value range used when bins is a count.
+            clip: Whether to count values outside the bin edges in the first or
+                last bin instead of ignoring them.
 
         Returns:
-            A pair containing the frequency-by-bin histogram and bin edges. The
+            A pair containing the bin-by-frequency counts and the bin edges. The
             bin edges are None when the buffer is empty.
 
         Raises:
             ValueError: If nb_value exceeds the buffer capacity.
         """
         with self.lock:
-            hist = []
-            bin_edges = None
             if self._current_size == 0:
-                return np.zeros((bins, len(self._x))), None
-            if nb_value is None:
-                nb_value = self._current_size
-            if nb_value > self.buffer_size:
-                raise ValueError("nb_value cannot be greater than buffer_size")
-            idxs = [
-                (self._next_idx - i - 1) % self.buffer_size for i in range(nb_value)
-            ]
-            data = self._z[idxs][::-1]
-        for i in range(data.shape[1]):
-            h, edges = np.histogram(data[:, i], bins=bins, range=data_range)
-            hist.append(h)
-            if bin_edges is None:
-                bin_edges = edges
-        return np.fliplr(np.rot90(np.array(hist), axes=(1, 0))), bin_edges
+                nb_bins = bins if np.isscalar(bins) else len(bins) - 1
+                return np.zeros((nb_bins, len(self._x))), None
+            nb_value = self._count(nb_value, "nb_value")
+            data = self._last_rows(self._z, nb_value).copy()
 
-    def __get_maxdata(self, nb_value=None, pad_value=0):
+        edges = np.histogram_bin_edges(data, bins=bins, range=data_range)
+        nb_bins = len(edges) - 1
+        n_freq = data.shape[1]
+        if clip:
+            data = np.clip(data, edges[0], edges[-1])
+        # Like numpy.histogram, the last bin includes its right edge.
+        idx = np.searchsorted(edges, data, side="right") - 1
+        idx[data == edges[-1]] = nb_bins - 1
+        valid = (idx >= 0) & (idx < nb_bins)
+        flat = idx + nb_bins * np.arange(n_freq)
+        counts = np.bincount(flat[valid], minlength=nb_bins * n_freq)
+        return counts.reshape(n_freq, nb_bins).T, edges
+
+    def _padded_y(self, nb_value):
+        """Return timestamps for nb_value rows, extrapolating missing leading ones."""
         with self.lock:
-            if self._current_size == 0:
-                return np.zeros((nb_value if nb_value else 0, len(self._x)))
-            if nb_value is None:
-                nb_value = self._current_size
-            if nb_value > self.buffer_size:
-                raise ValueError("nb_value cannot be greater than buffer_size")
-            idxs = [
-                (self._next_idx - i - 1) % self.buffer_size for i in range(nb_value)
-            ]
-            maxdata = self._z_max[idxs][::-1]
-        if nb_value > maxdata.shape[0]:
-            padding = ((nb_value - maxdata.shape[0], 0), (0, 0))
-            maxdata = np.pad(
-                maxdata, padding, mode="constant", constant_values=pad_value
-            )
-        return maxdata
+            y_data = self._y[: self._current_size].copy()
+        if nb_value > y_data.shape[0]:
+            padding_size = nb_value - y_data.shape[0]
+            if y_data.shape[0] > 0:
+                interval = np.median(np.diff(y_data)) if y_data.shape[0] > 1 else 1
+                pad_start = y_data[0] - interval * padding_size
+                padding = np.arange(pad_start, y_data[0], interval, dtype=int)
+            else:
+                padding = np.zeros(padding_size, dtype=int)
+            y_data = np.pad(y_data, (padding_size, 0), mode="constant")
+            y_data[:padding_size] = padding
+        return y_data
 
     def get_3D(self, nb_value=None, pad_value=0):
         """Return frequency coordinates, padded timestamps, and raw samples.
@@ -332,65 +291,4 @@ class SpectrumDataStorage:
             ValueError: If nb_value exceeds the buffer capacity.
         """
         z_data = self.get_data(nb_value, pad_value)
-        if nb_value is None:
-            nb_value = z_data.shape[0]
-        if nb_value > self.buffer_size:
-            raise ValueError("nb_value cannot be greater than buffer_size")
-        with self.lock:
-            y_data = self._y[: self._current_size]
-        if nb_value > y_data.shape[0]:
-            padding_size = nb_value - y_data.shape[0]
-            if y_data.shape[0] > 1:
-                interval = np.median(np.diff(y_data))  # Calculate median interval
-            else:
-                interval = 1  # Default interval if not enough data points
-            pad_start = (
-                y_data[0] - interval * padding_size if y_data.shape[0] > 0 else 0
-            )
-            padding = (
-                np.arange(pad_start, y_data[0], interval, dtype=int)
-                if y_data.shape[0] > 0
-                else np.zeros(padding_size, dtype=int)
-            )
-            y_data = np.pad(
-                y_data, (padding_size, 0), mode="constant", constant_values=pad_value
-            )
-            y_data[:padding_size] = padding
-        return self._x, y_data, z_data
-
-    def get_max3D(self, nb_value=None, pad_value=0):
-        """Return frequency coordinates, padded timestamps, and rolling maxima.
-
-        Args:
-            nb_value: Number of rows to return, or None for the number stored.
-            pad_value: Value used to fill leading rows when padding is needed.
-
-        Raises:
-            ValueError: If nb_value exceeds the buffer capacity.
-        """
-        z_max = self.__get_maxdata(nb_value, pad_value)
-        if nb_value is None:
-            nb_value = z_max.shape[0]
-        if nb_value > self.buffer_size:
-            raise ValueError("nb_value cannot be greater than buffer_size")
-        with self.lock:
-            y_data = self._y[: self._current_size]
-        if nb_value > y_data.shape[0]:
-            padding_size = nb_value - y_data.shape[0]
-            if y_data.shape[0] > 1:
-                interval = np.median(np.diff(y_data))  # Calculate median interval
-            else:
-                interval = 1  # Default interval if not enough data points
-            pad_start = (
-                y_data[0] - interval * padding_size if y_data.shape[0] > 0 else 0
-            )
-            padding = (
-                np.arange(pad_start, y_data[0], interval, dtype=int)
-                if y_data.shape[0] > 0
-                else np.zeros(padding_size, dtype=int)
-            )
-            y_data = np.pad(
-                y_data, (padding_size, 0), mode="constant", constant_values=pad_value
-            )
-            y_data[:padding_size] = padding
-        return self._x, y_data, z_max
+        return self._x, self._padded_y(z_data.shape[0]), z_data

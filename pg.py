@@ -1,4 +1,3 @@
-import re
 import time
 
 import numpy as np
@@ -20,9 +19,8 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
         self.values = 90
         self.raw = True
         self.min_limit = -92
-        self.worker = Worker(self)
-
         self.spectrum = SpectrumDataStorage(self.timerange)
+        self.worker = Worker(self.spectrum)
 
         self.initUI()
         self.initWorker()
@@ -201,22 +199,35 @@ class SpectrumAnalyzer(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def update_plots(self):
-        """Refresh the plots with the latest spectrum data."""
+        """Refresh the plots with the latest spectrum data.
+
+        Nothing is drawn while the window is minimized; data keeps accumulating.
+        """
+        if self.isMinimized():
+            return
         x = self.spectrum.x
         hits, _ = self.spectrum.histogram(
-            nb_value=self.values, bins=np.arange(self.min_limit, 1)
+            nb_value=self.values, bins=np.arange(self.min_limit, 1), clip=True
         )
         if self.raw:
-            self.c_values.setData(x=x, y=self.spectrum.get())
+            self.c_values.setData(x=x, y=self.spectrum.get(), skipFiniteCheck=True)
         else:
             smooth_x, smooth = self.spectrum.get_smooth()
-            self.c_values.setData(x=smooth_x, y=smooth)
-        self.c_avg.setData(x=x, y=self.spectrum.get_mean(self.values))
-        self.c_max.setData(x=x, y=self.spectrum.get_max(self.values))
+            self.c_values.setData(x=smooth_x, y=smooth, skipFiniteCheck=True)
+        self.c_avg.setData(
+            x=x, y=self.spectrum.get_mean(self.values), skipFiniteCheck=True
+        )
+        self.c_max.setData(
+            x=x, y=self.spectrum.get_max(self.values), skipFiniteCheck=True
+        )
         self.img_hm.setImage(
             self.spectrum.get_data(self.values, -110), autoLevels=False
         )
-        self.img_hits.setImage(hits, autoLevels=True, autoDownSample=True)
+        # Edge rows hold clipped values and would otherwise dominate the colour scale.
+        hits_max = max(int(hits[1:-1].max(initial=0)), 1)
+        self.img_hits.setImage(
+            hits, levels=(0, hits_max), autoLevels=False, autoDownSample=True
+        )
 
 
 class Worker(QtCore.QObject):
@@ -224,44 +235,35 @@ class Worker(QtCore.QObject):
 
     data_acquired = QtCore.Signal()
 
-    def __init__(self, parent):
-        """Initialize the worker with its owning spectrum-analyzer window.
+    def __init__(self, spectrum):
+        """Initialize the worker with the storage receiving acquired samples.
 
         Args:
-            parent: Window whose spectrum storage receives acquired samples.
+            spectrum: Spectrum storage that receives acquired samples.
         """
         super().__init__()
-        self.parent = parent
+        self.spectrum = spectrum
         self.stop_thread = False
 
     def acquire(self):
         """Read spectrum scans from the analyzer and emit data-acquired signals."""
         port = self.findport("AirView")
         with serial.Serial(port, 115200, timeout=1) as ser:
-            ser.write(b"\x0a")
-            ser.write(b"gdi")
-            ser.write(b"\x0a")
-            ser.write(b"\x0a")
-            ser.write(b"init")
-            ser.write(b"\x0a")
-            ser.write(b"\x0a")
-            ser.write(b"bs")
-            ser.write(b"\x0a")
+            ser.write(b"\ngdi\n\ninit\n\nbs\n")
 
             while not self.stop_thread:
                 line = ser.readline()
-                print(line)
-                m = re.findall(b"scan\\|\\d+,(.*)\\n", line)
-                if m:
-                    for n in m:
-                        values = n.split()
-                        values_int = np.array([int(v.decode("utf-8")) for v in values])
-                        # for freq in (2400.0, 2412.0, 2424.0, 2436.0, 2448.0, 2460.0, 2484.0):
-                        #     i = np.where(self.parent.spectrum.x == freq)[0][0]
-                        #     values_int[i] = -98 if values_int[i] <= -90 else values_int[i]
-                        timestamp = time.time_ns()
-                        self.parent.spectrum.append(timestamp, values_int)
-                        self.data_acquired.emit()
+                # A read timeout can return a partial line, which has no newline.
+                if not (line.startswith(b"scan|") and line.endswith(b"\n")):
+                    continue
+                try:
+                    values_int = np.array(
+                        list(map(int, line.split(b",", 1)[1].split())), dtype=np.int64
+                    )
+                    self.spectrum.append(time.time_ns(), values_int)
+                except IndexError, ValueError:
+                    continue
+                self.data_acquired.emit()
 
     def findport(self, desc):
         """Find the name of the first serial port matching a description.
